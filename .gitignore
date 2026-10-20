@@ -13,6 +13,8 @@ prisma/migrations/*
 !prisma/migrations/20260827100000_add_harvest_executions/migration.sql
 !prisma/migrations/20260929100000_add_sep31_metadata/
 !prisma/migrations/20260929100000_add_sep31_metadata/migration.sql
+!prisma/migrations/20261019120000_add_governance_voting_power_checkpoints/
+!prisma/migrations/20261019120000_add_governance_voting_power_checkpoints/migration.sql
 docs/
 backups/
 .env

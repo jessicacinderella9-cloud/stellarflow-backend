@@ -8,6 +8,15 @@ import { logger } from "../utils/logger";
 import { parseBase64ToPositiveNumber } from "../serialization/helpers.js";
 import { verifyOrderFilledEvent } from "./orderFillVerificationService.js";
 import { ingestGovernanceVoteEvent } from "./voterHistoryService.js";
+import { storeVotingPowerCheckpoint } from "./votingPowerCheckpointService.js";
+import {
+  ingestDelegateChanged,
+  ingestDelegateVotesChanged,
+} from "./votingPowerCheckpointIndexer.js";
+import {
+  circuitBreakerWebhookService,
+  type CircuitBreakerEvent,
+} from "./circuitBreakerWebhook.js";
 import { getCacheInvalidationManager } from "../cache/CacheInvalidationManager";
 import { getOrderBookSnapshotEngine } from "./orderBookSnapshotEngine";
 import { getAmmReserveDivergenceDetector } from "./ammReserveDivergenceDetector";
@@ -184,6 +193,7 @@ export class SorobanEventListener {
       await this.pollGovernanceVoteEvents();
       await this.pollCircuitBreakerEvents();
       await this.pollVotingPowerCheckpointEvents();
+      await this.pollDelegationCheckpointEvents();
 
       const transactions = await this.server
         .transactions()
@@ -463,6 +473,105 @@ export class SorobanEventListener {
       } catch (err) {
         logger.error(
           "[EventListener] Failed to ingest checkpointCreated event:",
+          err,
+        );
+      }
+    }
+  }
+
+  /**
+   * Polls Soroban for DelegateChanged and DelegateVotesChanged events emitted
+   * by the governance contract and maintains the checkpointed voting power
+   * ranges of Issue #1255 (start/end block numbers per address + delegation
+   * edge), feeding get_past_votes(address, ledger_sequence).
+   *
+   * Expected event topics: ["DelegateChanged", delegator, delegate]
+   *                        ["DelegateVotesChanged", account]
+   * Expected event data:   { previousDelegate?, previousVotes?, newVotes }
+   */
+  private async pollDelegationCheckpointEvents(): Promise<void> {
+    const contractId = (
+      process.env.GOVERNANCE_CONTRACT_ID ?? process.env.CONTRACT_ID
+    )?.trim();
+    if (!contractId) return;
+
+    const rpc = stellarProvider.getRpcServer() as any;
+
+    let response: { events?: any[] };
+    try {
+      response = await rpc.getEvents({
+        startLedger: Math.max(1, this.lastProcessedLedger),
+        filters: [
+          {
+            type: "contract",
+            contractIds: [contractId],
+            topics: [["DelegateChanged", "*"], ["DelegateVotesChanged", "*"]],
+          },
+        ],
+        limit: 200,
+      });
+    } catch (err) {
+      logger.networkError(
+        "[EventListener] DelegateChanged/DelegateVotesChanged poll failed:",
+        { err },
+      );
+      return;
+    }
+
+    for (const event of response.events ?? []) {
+      try {
+        // Topics: [eventName, delegator|account, delegate?]
+        const topics: string[] = event.topic ?? [];
+        const eventName = topics[0];
+        const ledger: number = Number(event.ledger ?? 0);
+        const dataVal = event.value?.value ?? event.value ?? {};
+        const txHash: string | null = event.txHash ?? event.id ?? null;
+
+        if (eventName === "DelegateChanged") {
+          const delegator: string | undefined =
+            topics[1] ?? dataVal.delegator;
+          const delegate: string | undefined =
+            topics[2] ?? dataVal.delegate ?? dataVal.newDelegate;
+          if (!delegator || !delegate) continue;
+
+          await ingestDelegateChanged({
+            delegator,
+            delegate,
+            previousDelegate: dataVal.previousDelegate ?? null,
+            ledgerSequence: ledger,
+            txHash,
+          });
+        } else if (eventName === "DelegateVotesChanged") {
+          const accountId: string | undefined =
+            topics[1] ?? dataVal.account ?? dataVal.accountId;
+          if (!accountId) continue;
+
+          const newVotes =
+            dataVal.newVotes ??
+            dataVal.newVoteWeight ??
+            dataVal.votingWeight ??
+            "0";
+
+          await ingestDelegateVotesChanged({
+            accountId,
+            previousVotes:
+              dataVal.previousVotes !== undefined &&
+              dataVal.previousVotes !== null
+                ? String(dataVal.previousVotes)
+                : null,
+            votingWeight: String(newVotes),
+            ledgerSequence: ledger,
+            txHash,
+          });
+        } else {
+          continue;
+        }
+
+        if (ledger > this.lastProcessedLedger)
+          this.lastProcessedLedger = ledger;
+      } catch (err) {
+        logger.error(
+          "[EventListener] Failed to ingest delegation checkpoint event:",
           err,
         );
       }

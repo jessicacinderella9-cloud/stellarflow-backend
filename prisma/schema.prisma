@@ -876,6 +876,47 @@ model VotingPowerCheckpoint {
   @@index([accountId, createdAt])
 }
 
+// DAO Governance Voting Power Historical Checkpoint Indexer – Issue #1255.
+// One row per (address, weight range): a DelegateVotesChanged event closes the
+// address' open range at the event ledger and opens a new one carrying the new
+// weight, so every row stores a historical vote weight with its starting block
+// (`fromLedger`, inclusive) and ending block (`toLedger`, exclusive, null while
+// the range is still open). get_past_votes(address, ledgerSequence) resolves
+// the covering range with a single indexed lookup.
+model GovernanceVotingPowerCheckpoint {
+  id           Int      @id @default(autoincrement())
+  accountId    String   // Stellar account this voting power range belongs to
+  fromLedger   Int      // starting block number of the range (inclusive)
+  toLedger     Int?     // ending block number (exclusive); null while open
+  votingWeight Decimal  @db.Decimal(38, 18) // vote weight while the range is active
+  txHash       String?  // transaction that produced the checkpoint
+  createdAt    DateTime @default(now())
+
+  // One range start per account per ledger – also the get_past_votes index:
+  // equality on accountId + range scan on fromLedger, ordered newest-first.
+  @@unique([accountId, fromLedger])
+  // Closing/open-range maintenance: find the currently open range for an account
+  @@index([accountId, toLedger])
+  // Proposal eligibility scans: ranges starting at/before a given ledger
+  @@index([fromLedger])
+}
+
+// DelegateChanged history – the same range model applied to delegation edges,
+// so historical delegation shifts stay queryable for any past ledger sequence
+// alongside the vote weight checkpoints above (Issue #1255).
+model GovernanceDelegationCheckpoint {
+  id         Int      @id @default(autoincrement())
+  delegator  String   // account that granted (or revoked) the delegation
+  delegate   String   // account receiving voting power while the range is active
+  fromLedger Int      // starting block number of the delegation (inclusive)
+  toLedger   Int?     // ending block number (exclusive); null while open
+  txHash     String?
+  createdAt  DateTime @default(now())
+
+  @@unique([delegator, fromLedger])
+  @@index([delegator, toLedger])
+}
+
 model TimelockEvent {
   id         String   @id @default(uuid())
   eventType  String
